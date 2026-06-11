@@ -225,11 +225,12 @@ mezzanotte per rinnovare i crediti e gestire le rate.
 
 ### Regole di dominio
 
-- **Prenotazioni** — slot da 30 minuti generati dai `WeeklySchedule` dei professionisti. Locking a doppio livello (`ReentrantLock` JVM + `PESSIMISTIC_WRITE` DB) contro l'overbooking. Cancellazione gratuita con credito rimborsato se richiesta con almeno 24 ore di anticipo. Alla prenotazione viene generato automaticamente un link **Jitsi** e inviata una email post-commit. Il `BookingReminderScheduler` invia i promemoria, impostando `reminderSent` per evitare duplicati.
+- **Prenotazioni** — slot da 30 minuti generati dai `WeeklySchedule` dei professionisti. Locking a tre livelli contro l'overbooking e le incoerenze sui crediti: `ReentrantLock` per-slot in-memory (`ConcurrentHashMap<Long, LockReference>` in `BookingFacadeImpl`), `PESSIMISTIC_WRITE` sulla riga a DB (`SlotRepository.findByIdWithLock`, `SubscriptionRepository.findByUserAndActiveTrueWithLock`) e optimistic locking via `@Version`. Cancellazione gratuita con credito rimborsato se richiesta con almeno 24 ore di anticipo. Alla prenotazione viene generato automaticamente un link **Jitsi** e inviata una email post-commit. Il `BookingReminderScheduler` invia i promemoria, impostando `reminderSent` per evitare duplicati.
 - **Recensioni** — un cliente può recensire un professionista solo se esiste almeno una prenotazione confermata tra i due (o è attualmente assegnato) e non ha già recensito quella coppia (unicità garantita a DB).
-- **Chat** — real-time via STOMP/WebSocket con autenticazione JWT sul frame CONNECT; fallback REST per lo storico. I permessi (`validateChatPermission()`) seguono l'ordine di guardie ADMIN → INSURANCE_MANAGER → MODERATOR → controllo assegnazione. Il pulsante "Contatta Amministrazione" apre una chat con un **moderatore** casuale; il moderatore può chiudere la conversazione.
+- **Chat** — real-time via STOMP/WebSocket con autenticazione JWT sul frame CONNECT; fallback REST per lo storico. I permessi (`validateChatPermission()`) seguono l'ordine di guardie ADMIN → INSURANCE_MANAGER → MODERATOR → controllo assegnazione. Il pulsante "Contatta Amministrazione" apre una chat con un **moderatore**: riusa quella già esistente se presente, altrimenti seleziona il moderatore con il **minor numero di chat aperte** (`countOpenChatsByModerator`, load balancing); il moderatore può chiudere la conversazione.
 - **Documenti** — storage su filesystem (`uploads/`) con metadati a DB: schede di allenamento (PT), piani alimentari (Nutrizionista), polizze (Insurance Manager).
-- **Activity Feed** — `GET /api/activity` restituisce prenotazioni e documenti recenti, ordinati cronologicamente.
+- **Limite clienti** — ogni professionista (PT/Nutrizionista) può seguire al massimo `MAX_CLIENTS_PER_PROFESSIONAL = 50` clienti contemporaneamente (`util/BusinessConstants`). Le altre costanti di business vivono nello stesso file: `MAX_MESSAGE_LENGTH = 2000`, lunghezza password `8`–`100`, `EMAIL_REGEX`.
+- **Activity Feed** — `GET /api/activity/feed` restituisce prenotazioni e documenti recenti, ordinati cronologicamente.
 - **Candidature** — `POST /api/job-applications` riceve un CV in PDF e lo inoltra via email.
 - **Statistiche dashboard** — KPI per ADMIN (utenti per ruolo, crescita mensile, popolarità piani, ricavi, prenotazioni, carico professionisti) e per PT/Nutrizionista (prenotazioni odierne, clienti da seguire, documenti caricati nella settimana).
 - **Audit trail** — `AuditLog` + `AuditInterceptor` registrano tutte le azioni utente.
@@ -251,7 +252,7 @@ I 16 controller espongono la superficie API sotto `/api`.
 | `UserController` | `/api/users` | Autenticato |
 | `DocumentController` | `/api/documents` | CLIENT (lettura), PT/NUTRITIONIST/INSURANCE (upload) |
 | `ChatController` | `/api/chat` + WebSocket `/ws` | Autenticato |
-| `ActivityFeedController` | `/api/activity` | Autenticato |
+| `ActivityFeedController` | `/api/activity/feed` | Autenticato |
 | `PlanController` | `/api/plans` | Pubblico (lettura) |
 | `AdminController` | `/api/admin` | ADMIN |
 | `ModeratorController` | `/api/moderator` | MODERATOR |
@@ -275,9 +276,11 @@ I 16 controller espongono la superficie API sotto `/api`.
 
 La consegna asincrona dei messaggi di chat passa da `ChatMessagePublisher` →
 `ChatMessageConsumer`. I messaggi non recuperabili vengono instradati alla **Dead Letter Queue**
-`chat.messages.dlq` (`default-requeue-rejected: false`, `max-attempts: 3`,
-`AmqpRejectAndDontRequeueException` per gli errori permanenti). I thread pool sono configurati in
-`AsyncConfig`.
+`chat.messages.dlq`. La coda principale è dichiarata con `x-dead-letter-exchange`/
+`x-dead-letter-routing-key` verso la DLQ e il listener usa `setDefaultRequeueRejected(false)`
+(`RabbitMQConfig`): gli errori permanenti sollevano `AmqpRejectAndDontRequeueException` e finiscono
+in DLQ **senza retry**, mentre gli altri errori restano gestiti dal broker. I thread pool sono
+configurati in `AsyncConfig`.
 
 ---
 
@@ -287,7 +290,7 @@ La consegna asincrona dei messaggi di chat passa da `ChatMessagePublisher` →
 |---|---|---|
 | `SubscriptionScheduler` | `0 0 0 * * ?` (ogni notte a mezzanotte) | Rinnovo crediti mensili e gestione delle rate |
 | `BookingReminderScheduler` | `0 */5 * * * ?` (ogni 5 minuti) | Invio promemoria e set di `reminderSent` per evitare duplicati |
-| `SlotGenerationScheduler` | all'avvio / pianificato | Generazione degli slot da 30 minuti dai `WeeklySchedule` |
+| `SlotGenerationScheduler` | `0 0 0 * * SUN` (ogni domenica a mezzanotte) | Generazione degli slot da 30 minuti dai `WeeklySchedule` |
 
 Gli scheduler vengono disabilitati automaticamente durante i test.
 
@@ -341,9 +344,9 @@ cd kore
 ./mvnw spring-boot:run -Dspring-boot.run.profiles=dev
 ```
 
-All'avvio del profilo `dev`, Docker Compose lancia automaticamente:
+All'avvio Docker Compose lancia automaticamente:
 
-- **PostgreSQL** su `localhost:5432`
+- **PostgreSQL** su `localhost:5432` (DB `postgres`, utente `postgres` / `secret`)
 - **pgAdmin** su `localhost:5050` (`a@a.a` / `root`)
 - **RabbitMQ** su `localhost:5672`; management UI su `localhost:15672` (`guest` / `guest`)
 
@@ -435,6 +438,8 @@ Configurazione in `src/main/resources/log4j2-spring.xml`, con tre appender:
 - **DDL dev** — `ddl-auto: create` ricrea lo schema ad ogni avvio; `data.sql` lo ripopola.
 - **Jitsi** — il base URL delle stanze è configurabile (`https://meet.jit.si/Kore_Consulto_...` di default).
 - **DB di log separato** — `kore_logs` è un catalog PostgreSQL distinto dal database principale.
+- **Email solo SMTP** — l'invio email passa interamente da `JavaMailSender`/SMTP in `EmailServiceImpl`. La Javadoc dell'interfaccia `EmailService` e alcune chiavi `resend.*` in `test/resources/application.yaml` citano "Resend", ma è un residuo non più utilizzato.
+- **Email mittente/admin** — il mittente effettivo è `spring.mail.username`; nota che `EmailServiceImpl` contiene anche un `adminEmail` hardcoded (`admin@example.com`) che diverge da `admin.email` in `application.yaml`.
 
 ---
 
